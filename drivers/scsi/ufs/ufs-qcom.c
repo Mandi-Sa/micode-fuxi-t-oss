@@ -27,12 +27,12 @@
 #include <soc/qcom/minidump.h>
 #include <linux/nvmem-consumer.h>
 
-#include "ufshcd.h"
-#include "ufshcd-pltfrm.h"
-#include "unipro.h"
+#include "../mi_ufs/mi_ufshcd.h"
+#include "../mi_ufs/mi-ufshcd-pltfrm.h"
+#include "../mi_ufs/mi_unipro.h"
 #include "ufs-qcom.h"
-#include "ufshci.h"
-#include "ufs_quirks.h"
+#include "../mi_ufs/mi_ufshci.h"
+#include "../mi_ufs/mi_ufs_quirks.h"
 #include "ufshcd-crypto-qti.h"
 
 #define UFS_QCOM_DEFAULT_DBG_PRINT_EN	\
@@ -148,6 +148,10 @@ static int ufs_qcom_unvote_qos_all(struct ufs_hba *hba);
 static void ufs_qcom_parse_g4_workaround_flag(struct ufs_qcom_host *host);
 static int ufs_qcom_mod_min_cpufreq(unsigned int cpu, s32 new_val);
 static int ufs_qcom_config_shared_ice(struct ufs_qcom_host *host);
+#ifdef CONFIG_UFS_EBUFF
+extern bool of_obtain_ebuffha_info(void);
+extern bool ebuff_value_u32(char *pname, u32 *value);
+#endif
 
 static inline void cancel_dwork_unvote_cpufreq(struct ufs_hba *hba)
 {
@@ -1831,6 +1835,13 @@ static int ufs_qcom_bus_register(struct ufs_qcom_host *host)
 
 static void ufs_qcom_dev_ref_clk_ctrl(struct ufs_qcom_host *host, bool enable)
 {
+#ifdef CONFIG_UFS_EBUFF
+	u32 value = 0;
+	if (ebuff_value_u32("ref_clk_always_on", &value)) {
+		pr_info("%s:ebuff ref_clk_always_on %d\n", __func__, value);
+		return;
+	}
+#endif
 	if (host->dev_ref_clk_ctrl_mmio &&
 	    (enable ^ host->is_dev_ref_clk_enabled)) {
 		u32 temp = readl_relaxed(host->dev_ref_clk_ctrl_mmio);
@@ -1876,8 +1887,7 @@ static void ufs_qcom_dev_ref_clk_ctrl(struct ufs_qcom_host *host, bool enable)
 		 * exit command.
 		 */
 		if (enable)
-			usleep_range(50, 60);
-
+			usleep_range(1000, 1100);
 		host->is_dev_ref_clk_enabled = enable;
 	}
 }
@@ -1892,6 +1902,9 @@ static int ufs_qcom_pwr_change_notify(struct ufs_hba *hba,
 	struct phy *phy = host->generic_phy;
 	struct ufs_qcom_dev_params ufs_qcom_cap;
 	int ret = 0;
+#ifdef CONFIG_UFS_EBUFF
+	u32 value = 0;
+#endif
 
 	if (!dev_req_params) {
 		ufs_qcom_msg(ERR, NULL, "%s: incoming dev_req_params is NULL\n", __func__);
@@ -1918,7 +1931,16 @@ static int ufs_qcom_pwr_change_notify(struct ufs_hba *hba,
 
 		ufs_qcom_cap.desired_working_mode =
 					UFS_QCOM_LIMIT_DESIRED_MODE;
-
+#ifdef CONFIG_UFS_EBUFF
+	if (ebuff_value_u32("tx-lane", &value) && (value > 0 && value <= UFS_QCOM_LIMIT_NUM_LANES_TX)) {
+		ufs_qcom_cap.tx_lanes = value;
+		dev_info(hba->dev, "%s: ebuff set tx_lanes %d\n", __func__, ufs_qcom_cap.tx_lanes);
+	}
+	if (ebuff_value_u32("rx-lane", &value) && (value > 0 && value <= UFS_QCOM_LIMIT_NUM_LANES_RX)) {
+		ufs_qcom_cap.rx_lanes = value;
+		dev_info(hba->dev, "%s: ebuff set rx_lanes %d\n", __func__, ufs_qcom_cap.rx_lanes);
+	}
+#endif
 		ret = ufs_qcom_get_pwr_dev_param(&ufs_qcom_cap,
 						 dev_max_params,
 						 dev_req_params);
@@ -2162,6 +2184,9 @@ static u32 ufs_qcom_get_ufs_hci_version(struct ufs_hba *hba)
 static void ufs_qcom_advertise_quirks(struct ufs_hba *hba)
 {
 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+#ifdef CONFIG_UFS_EBUFF
+	u32 value = 0;
+#endif
 
 	if (host->hw_ver.major == 0x01) {
 		hba->quirks |= UFSHCD_QUIRK_DELAY_BEFORE_DME_CMDS
@@ -2187,6 +2212,19 @@ static void ufs_qcom_advertise_quirks(struct ufs_hba *hba)
 	if (host->disable_lpm)
 		hba->quirks |= UFSHCD_QUIRK_BROKEN_AUTO_HIBERN8;
 
+#ifdef CONFIG_UFS_EBUFF
+	if (ebuff_value_u32("host_quirks", &value)) {
+		u32 mask = 0;
+		if (ebuff_value_u32("host_quirks_mask", &mask)) {
+			dev_info(hba->dev, "%s: ebuff origin host_quirks 0x%x value 0x%x mask 0x%x\n", __func__, hba->quirks, value, mask);
+			hba->quirks = (hba->quirks & (~mask)) | (value & mask);
+		} else {
+			dev_info(hba->dev, "%s: ebuff origin host_quirks 0x%x value 0x%x\n", __func__, hba->quirks, value);
+			hba->quirks |= value;
+		}
+	}
+#endif
+
 #if IS_ENABLED(CONFIG_SCSI_UFS_CRYPTO_QTI)
 	hba->quirks |= UFSHCD_QUIRK_CUSTOM_KEYSLOT_MANAGER;
 #endif
@@ -2195,7 +2233,9 @@ static void ufs_qcom_advertise_quirks(struct ufs_hba *hba)
 static void ufs_qcom_set_caps(struct ufs_hba *hba)
 {
 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
-
+#ifdef CONFIG_UFS_EBUFF
+	u32 value = 0;
+#endif
 	if (!host->disable_lpm) {
 		hba->caps |= UFSHCD_CAP_CLK_GATING |
 		UFSHCD_CAP_HIBERN8_WITH_CLK_GATING |
@@ -2227,6 +2267,19 @@ static void ufs_qcom_set_caps(struct ufs_hba *hba)
 
 	if (host->hw_ver.major >= 0x5)
 		host->caps |= UFS_QCOM_CAP_SHARED_ICE;
+
+#ifdef CONFIG_UFS_EBUFF
+	if (ebuff_value_u32("caps", &value)) {
+		u32 mask = 0;
+		if (ebuff_value_u32("caps_mask", &mask)) {
+			dev_info(hba->dev, "%s: ebuff origin caps 0x%x value 0x%x mask 0x%x\n", __func__, hba->caps, value, mask);
+			hba->caps = (hba->caps & (~mask)) | (value & mask);
+		} else {
+			dev_info(hba->dev, "%s: ebuff origin caps 0x%x value 0x%x\n", __func__, host->caps, value);
+			host->caps |= value;
+		}
+	}
+#endif
 }
 
 static int ufs_qcom_unvote_qos_all(struct ufs_hba *hba)
@@ -2549,7 +2602,7 @@ ufs_qcom_query_ioctl(struct ufs_hba *hba, u8 lun, void __user *buffer)
 			err = -ENOMEM;
 			goto out_release_mem;
 		}
-		err = ufshcd_query_descriptor_retry(hba, ioctl_data->opcode,
+		err = mi_ufshcd_query_descriptor_retry(hba, ioctl_data->opcode,
 						    ioctl_data->idn, index, 0,
 						    desc, &length);
 		break;
@@ -4087,6 +4140,10 @@ static void ufs_qcom_parse_limits(struct ufs_qcom_host *host)
 	u32 val;
 	u32 dev_major = 0, dev_minor = 0;
 
+#ifdef CONFIG_UFS_EBUFF
+	u32 ebuff_value = 0;
+#endif
+
 	if (!np)
 		return;
 
@@ -4126,6 +4183,22 @@ static void ufs_qcom_parse_limits(struct ufs_qcom_host *host)
 	of_property_read_u32(np, "limit-rx-pwm-gear", &host->limit_rx_pwm_gear);
 	of_property_read_u32(np, "limit-rate", &host->limit_rate);
 	of_property_read_u32(np, "limit-phy-submode", &host->limit_phy_submode);
+
+#ifdef CONFIG_UFS_EBUFF
+	if (ebuff_value_u32("rate", &ebuff_value)) {
+		if (ebuff_value == 1)
+			host->limit_rate = PA_HS_MODE_A;
+		else if (ebuff_value == 2)
+			host->limit_rate = PA_HS_MODE_B;
+	}
+
+	if (ebuff_value_u32("gear", &ebuff_value)) {
+		if (ebuff_value >= 1 && ebuff_value <= 4) {
+			host->limit_tx_hs_gear = (int)ebuff_value;
+			host->limit_rx_hs_gear = (int)ebuff_value;
+		}
+	}
+#endif
 }
 
 /*
@@ -4148,8 +4221,18 @@ static void ufs_qcom_parse_g4_workaround_flag(struct ufs_qcom_host *host)
 static void ufs_qcom_parse_lpm(struct ufs_qcom_host *host)
 {
 	struct device_node *node = host->hba->dev->of_node;
-
+#ifdef CONFIG_UFS_EBUFF
+	u32 ebuff_value = 2;
+#endif
 	host->disable_lpm = of_property_read_bool(node, "qcom,disable-lpm");
+#ifdef CONFIG_UFS_EBUFF
+	if (ebuff_value_u32("disable_lpm", &ebuff_value)) {
+		if (ebuff_value == 0)
+			host->disable_lpm = false;
+		else if (ebuff_value == 1)
+			host->disable_lpm = true;
+	}
+#endif
 	if (host->disable_lpm)
 		ufs_qcom_msg(INFO, host->hba->dev, "(%s) All LPM is disabled\n",
 			 __func__);
@@ -4688,6 +4771,10 @@ static int ufs_qcom_probe(struct platform_device *pdev)
 	 * Hence, check for the connected device early-on & don't turn-off
 	 * the regulators.
 	 */
+
+#ifdef CONFIG_UFS_EBUFF
+	of_obtain_ebuffha_info();
+#endif
 
 	/* Perform generic probe */
 	err = ufshcd_pltfrm_init(pdev, &ufs_hba_qcom_vops);
